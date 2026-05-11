@@ -1,0 +1,6 @@
+data/
+inference/models/
+CLAUDE.md
+__pycache__/
+*.pyc
+.env

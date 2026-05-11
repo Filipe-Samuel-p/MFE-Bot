@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mfebot
+      POSTGRES_USER: mfebot
+      POSTGRES_PASSWORD: mfebot
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mfebot -d mfebot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: ./inference
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data:ro
+      - ./inference/models:/app/models:ro
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: mfebot
+      DB_USER: mfebot
+      DB_PASSWORD: mfebot
+    restart: on-failure
+
+  api:
+    build: ./api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: mfebot
+      DB_USER: mfebot
+      DB_PASSWORD: mfebot
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
