@@ -1,0 +1,500 @@
+# CLAUDE.md — MFE-Bot
+
+Memória persistente do projeto. Este arquivo é lido automaticamente pelo Claude Code
+a cada nova sessão. Está no `.gitignore`.
+
+---
+
+## Identidade do projeto
+
+**Título completo:** MFE-Bot: Detecção de Bots via Empilhamento de Redes Neurais em
+Grafos e Random Forest com Roteamento por Cruzamento de Fronteira.
+
+**Contexto:** TCC de Ciência da Computação.
+
+**Objetivo:** Detectar bots em redes sociais combinando dois especialistas
+heterogêneos (perfil + rede), com um meta-classificador acionado apenas em casos
+de divergência, e uma camada de explicabilidade post-hoc para investigação
+qualitativa.
+
+---
+
+## Hipótese central
+
+A divergência entre um "perfil humano perfeito" e uma "estrutura de rede artificial"
+é a principal assinatura para detectar evasão. Fusionar especialistas heterogêneos
+via Stacking Ensemble com roteamento por cruzamento de fronteira detecta bots com
+maior precisão do que modelos individuais.
+
+---
+
+## Arquitetura do sistema
+
+### Pipeline de decisão
+
+```
+Entrada (TwiBot-20: perfil + listas de vizinhança)
+       │
+       ▼
+┌──────────────────────┐        ┌──────────────────────┐
+│   Random Forest      │        │      BotRGCN         │
+│  (calibrada)         │        │  (grafo heterogêneo) │
+└──────────┬───────────┘        └──────────┬───────────┘
+           │ p_rf                          │ p_gnn
+           └────────────────┬──────────────┘
+                            ▼
+            Roteador por Cruzamento de Fronteira
+                pred_rf == pred_gnn ?
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+        CONVERGÊNCIA                 DIVERGÊNCIA
+   (mesma classe nos dois)       (classes opostas)
+              │                           │
+              ▼                           ▼
+     Média aritmética            Regressão Logística
+        dos scores                  (meta-classifier)
+              │                           │
+              └─────────────┬─────────────┘
+                            ▼
+                    PostgreSQL
+              (score bruto + classificação binária)
+                            │
+                            ▼
+                       API Golang
+```
+
+### Pipeline secundário — XAI sob demanda
+
+```
+Banco populado com scores e veredito
+       │
+       ▼
+Seleção de amostra (script ou endpoint)
+       │
+       ▼
+┌────────────────┐        ┌─────────────────┐
+│     SHAP       │        │  GNNExplainer   │
+│ (explica RF)   │        │  (explica GNN)  │
+└────────┬───────┘        └─────────┬───────┘
+         │                          │
+         └────────────┬─────────────┘
+                      ▼
+              Salva no banco
+              (campos JSONB)
+                      ▼
+              Retorna ao cliente
+```
+
+---
+
+## Camadas do sistema
+
+### 1. Camada Base (Inferência Paralela)
+
+- **Random Forest** (scikit-learn) — features tabulares de perfil
+  - Envolvido em `CalibratedClassifierCV` (método isotônico, cv=5)
+  - Calibração é **obrigatória** porque o roteamento depende da fronteira em 0.5
+- **BotRGCN** (PyTorch + PyTorch Geometric) — grafo heterogêneo
+  - Dois tipos de aresta: `follows` e `followed_by`
+
+### 2. Camada de Roteamento (Cruzamento de Fronteira)
+
+Lógica de Early Exit baseada **puramente em discordância de classe**:
+
+```python
+pred_rf  = p_rf  >= 0.5   # True = Bot, False = Humano
+pred_gnn = p_gnn >= 0.5
+
+if pred_rf == pred_gnn:
+    # CONVERGÊNCIA — RF=Bot E GNN=Bot, ou RF=Humano E GNN=Humano
+    # Sistema assume o consenso e sai do fluxo (Early Exit)
+    flag_divergente = False
+    veredito_final  = (p_rf + p_gnn) / 2
+    score_meta      = None
+else:
+    # DIVERGÊNCIA — classes opostas
+    # Aciona a Camada de Arbitragem
+    flag_divergente = True
+    score_meta      = meta_classificador.predict_proba([[p_rf, p_gnn]])[0][1]
+    veredito_final  = score_meta
+
+# Em ambos os casos, derivar a classificação binária
+classificacao_bot = 1 if veredito_final >= 0.5 else 0
+```
+
+### 3. Camada de Arbitragem (Meta-Classifier)
+
+- **Regressão Logística** treinada com scores do `dev.json`
+- Acionada **apenas** quando há divergência de classes
+- Modelo **caixa-branca**: os coeficientes da LR revelam o peso histórico
+  de cada modelo base — interpretabilidade nativa, sem necessidade de XAI
+
+### 4. Camada de XAI (Post-hoc, Sob Demanda)
+
+- **NÃO faz parte do pipeline de decisão**
+- **NÃO roda em lote no conjunto de teste completo**
+- **Funciona como ferramenta investigativa por amostragem**
+
+#### Ferramentas
+
+- **SHAP** (`TreeExplainer`) — explica decisões da Random Forest
+- **GNNExplainer** (`torch_geometric.explain`) — explica decisões da BotRGCN
+
+#### Quando é executado
+
+- Sob demanda via endpoint `GET /v1/audit/explanation/{id}`
+- Por script isolado para estudo de caso amostral
+
+#### Lazy evaluation
+
+```
+1. Endpoint chamado para user_id
+2. Verifica no banco se explicacao_rf e explicacao_gnn já existem
+3. Se existem → retorna do banco
+4. Se não existem → calcula SHAP + GNNExplainer, salva, retorna
+```
+
+#### Critério de seleção da amostra para o estudo de caso
+
+| Categoria | Critério SQL |
+|---|---|
+| Falsos positivos | `score_rf > 0.8` E `label_real = 0` |
+| Falsos negativos | `score_gnn < 0.2` E `label_real = 1` |
+| Divergências resolvidas | `flag_divergente = TRUE` E `classificacao_bot = label_real` |
+| Divergências falhadas | `flag_divergente = TRUE` E `classificacao_bot != label_real` |
+
+### 5. Camada de Persistência
+
+- PostgreSQL como fonte única da verdade
+- Estrutura dual: `veredito_final` (FLOAT) + `classificacao_bot` (INT)
+
+### 6. Camada de Serviço
+
+- API REST em Golang com arquitetura em camadas (handler → service → repository)
+
+---
+
+## Justificativa metodológica da abordagem dual
+
+O sistema é avaliado em **duas dimensões complementares**:
+
+| Dimensão | Onde se aplica | O que mede |
+|---|---|---|
+| **Quantitativa** | Pipeline principal em todo o `test.json` | F1, Precisão, Recall, Acurácia |
+| **Qualitativa** | XAI em amostra estratificada | Coerência das explicações |
+
+---
+
+## Dataset — TwiBot-20
+
+Três arquivos JSON em `data/` (no `.gitignore`):
+
+| Arquivo | Tamanho | Uso |
+|---|---|---|
+| `data/train.json` | 239 MB | Treino dos modelos base (Fase 1) |
+| `data/dev.json` | 68,9 MB | Validação — treino da Regressão Logística |
+| `data/test.json` | 34 MB | Teste — roda no sistema online (Fase 2) |
+
+Estrutura de cada usuário:
+
+```json
+{
+  "ID": "147725246",
+  "profile": { "followers_count": 161827, "friends_count": 361, ... },
+  "tweet": ["tweet 1", "tweet 2", ...],
+  "neighbor": {
+    "following": ["id1", "id2", ...],
+    "follower":  ["id3", "id4", ...]
+  },
+  "label": "0"
+}
+```
+
+- `label: "0"` = Humano, `label: "1"` = Bot
+- `neighbor: null` → usuário só alimenta o Random Forest, não entra no Stacking
+- O grafo heterogêneo é construído a partir de listas de vizinhança
+  (`following` e `follower`), **não de uma matriz de adjacência pronta**
+
+---
+
+## Estrutura de pastas
+
+```
+mfe-bot/
+├── CLAUDE.md                       ← este arquivo (no .gitignore)
+├── .gitignore
+├── docker-compose.yml
+├── init.sql                        ← schema do banco + view
+│
+├── data/                           ← dataset TwiBot-20 (no .gitignore)
+│   ├── train.json
+│   ├── dev.json
+│   └── test.json
+│
+├── inference/                      ← Service 2 (Python)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── models/                     ← modelos serializados
+│   │   ├── modelo_rf.pkl           ← já calibrado via CalibratedClassifierCV
+│   │   ├── modelo_gnn.pt
+│   │   └── modelo_lr.pkl
+│   ├── training/                   ← Fase 1 — roda local
+│   │   ├── train_rf.py
+│   │   ├── train_gnn.py
+│   │   └── train_lr.py
+│   ├── worker/                     ← Fase 2 — pipeline principal
+│   │   ├── run_inference.py        ← orquestrador (lote do test.json)
+│   │   └── router.py               ← lógica de cruzamento de fronteira
+│   ├── xai/                        ← módulo isolado, post-hoc
+│   │   ├── explain_rf.py           ← SHAP sob demanda
+│   │   ├── explain_gnn.py          ← GNNExplainer sob demanda
+│   │   └── sample_selector.py      ← seleciona amostra estratificada
+│   └── evaluation/
+│       └── metrics.py
+│
+└── api/                            ← Service 1 (Golang)
+    ├── Dockerfile
+    ├── go.mod
+    └── internal/                   ← arquitetura em camadas
+        ├── handler/
+        ├── service/
+        ├── repository/
+        └── model/
+```
+
+---
+
+## Banco de dados — PostgreSQL
+
+### Tabela principal
+
+```sql
+CREATE TABLE auditoria_deteccao_bots (
+    id                SERIAL PRIMARY KEY,
+    user_id           VARCHAR(50)  NOT NULL,
+    screen_name       VARCHAR(100),
+    score_rf          FLOAT        NOT NULL,
+    score_gnn         FLOAT        NOT NULL,
+    score_meta        FLOAT,                          -- NULL se convergente
+    flag_divergente   BOOLEAN      NOT NULL,
+    veredito_final    FLOAT        NOT NULL,         -- probabilidade bruta
+    classificacao_bot INTEGER      NOT NULL,         -- 0 ou 1 (derivada)
+    label_real        INTEGER,
+    explicacao_rf     JSONB,                          -- NULL por padrão
+    explicacao_gnn    JSONB,                          -- NULL por padrão
+    data_analise      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_user_id           ON auditoria_deteccao_bots(user_id);
+CREATE INDEX idx_flag_divergente   ON auditoria_deteccao_bots(flag_divergente);
+CREATE INDEX idx_label_real        ON auditoria_deteccao_bots(label_real);
+CREATE INDEX idx_classificacao_bot ON auditoria_deteccao_bots(classificacao_bot);
+```
+
+### View de auditoria legível
+
+```sql
+CREATE VIEW vw_auditoria_legivel AS
+SELECT
+    user_id,
+    screen_name,
+    ROUND(score_rf::numeric,  3) AS score_rf,
+    ROUND(score_gnn::numeric, 3) AS score_gnn,
+    flag_divergente,
+    CASE classificacao_bot
+        WHEN 1 THEN 'BOT'
+        WHEN 0 THEN 'HUMANO'
+    END AS classificacao,
+    CASE label_real
+        WHEN 1 THEN 'BOT'
+        WHEN 0 THEN 'HUMANO'
+    END AS gabarito,
+    CASE
+        WHEN classificacao_bot = label_real THEN '✓'
+        ELSE '✗'
+    END AS acerto
+FROM auditoria_deteccao_bots;
+```
+
+### Por que duas colunas para o veredito (bruto + binário)
+
+A estrutura dual atende dois consumidores diferentes sem comprometer nenhum:
+
+| Coluna | Para quem serve | Para que serve |
+|---|---|---|
+| `veredito_final` (FLOAT) | Cientista de dados | Ajustar limiar, calcular confiança, estudo de caso XAI |
+| `classificacao_bot` (INT) | Auditor humano | Leitura imediata, comparação direta com gabarito |
+
+A coluna binária é **derivada no momento do INSERT** via Python:
+`classificacao_bot = 1 if veredito_final >= 0.5 else 0`
+
+### Regras críticas
+
+- `veredito_final` é sempre **probabilidade bruta** (ex: 0.76), nunca 0 ou 1
+- `classificacao_bot` é sempre **0 ou 1**, calculado no INSERT
+- `label_real` é obrigatório em todo INSERT
+- `explicacao_rf` e `explicacao_gnn` começam NULL — preenchidos apenas
+  quando o XAI é acionado sob demanda
+
+### Casos do roteador no banco
+
+| Caso | `score_meta` | `flag_divergente` | `veredito_final` | `classificacao_bot` |
+|---|---|---|---|---|
+| RF=Bot E GNN=Bot | NULL | FALSE | (p_rf + p_gnn) / 2 | 1 |
+| RF=Humano E GNN=Humano | NULL | FALSE | (p_rf + p_gnn) / 2 | 0 |
+| RF=Bot E GNN=Humano | saída da LR | TRUE | saída da LR | 0 ou 1 |
+| RF=Humano E GNN=Bot | saída da LR | TRUE | saída da LR | 0 ou 1 |
+
+---
+
+## API Golang — endpoints
+
+| Endpoint | Descrição |
+|---|---|
+| `POST /v1/process/run-test` | Dispara o processamento do `test.json` |
+| `GET /v1/metrics/summary` | F1, Precisão, Recall da RF, GNN e MFE-Bot |
+| `GET /v1/metrics/efficiency` | Convergentes vs. divergentes |
+| `GET /v1/audit/divergent` | Lista usuários com `flag_divergente = TRUE` |
+| `GET /v1/audit/users/{id}` | Diagnóstico completo de um usuário |
+| `GET /v1/audit/explanation/{id}` | Aciona XAI sob demanda (lazy evaluation) |
+
+---
+
+## Fases de desenvolvimento
+
+### Fase 1 — Offline (Ciência de Dados)
+
+Roda local, fora do Docker. Gera os modelos serializados.
+
+1. Parse do TwiBot-20 (`train.json` e `dev.json`)
+2. Extração de features de perfil para o Random Forest
+3. Construção do grafo heterogêneo (PyTorch Geometric `HeteroData`)
+4. Treino do Random Forest **com `CalibratedClassifierCV`**
+5. Treino da BotRGCN com `train.json`
+6. Geração dos scores de validação com `dev.json` → treino da Regressão Logística
+7. Serialização: `modelo_rf.pkl`, `modelo_gnn.pt`, `modelo_lr.pkl`
+
+### Fase 2 — Online (Engenharia)
+
+Roda no Docker. Processa o teste e popula o banco.
+
+1. `docker-compose up` sobe PostgreSQL + Worker Python + API Golang
+2. Worker carrega os modelos treinados
+3. Processa `data/test.json` em batches via streaming (`ijson`)
+4. Para cada usuário:
+   - RF e BotRGCN em paralelo
+   - Roteador de cruzamento de fronteira
+   - Regressão Logística (se divergente)
+   - Calcula `classificacao_bot` a partir de `veredito_final`
+   - INSERT no banco com TODOS os campos incluindo `label_real`
+5. `evaluation/metrics.py` lê o banco e gera a tabela do TCC
+6. API Go expõe os endpoints
+7. XAI é executado posteriormente, sob demanda, sobre a amostra do estudo de caso
+
+---
+
+## Script de métricas
+
+```python
+# Modelos isolados: aplica limiar sobre o score bruto
+y_pred_rf  = (df["score_rf"]  >= 0.5).astype(int)
+y_pred_gnn = (df["score_gnn"] >= 0.5).astype(int)
+
+# Sistema completo: usa a classificação binária já gravada
+y_pred_sistema = df["classificacao_bot"]
+```
+
+Calcula para cada modelo: Acurácia, Precisão, Revocação, F1-Score.
+
+**Prova da tese:** F1 do MFE-Bot > F1 dos modelos individuais.
+
+---
+
+## Stack tecnológica
+
+| Componente | Tecnologia |
+|---|---|
+| Worker de inferência | Python 3.11 |
+| Random Forest | scikit-learn (com `CalibratedClassifierCV`) |
+| BotRGCN | PyTorch + PyTorch Geometric |
+| Meta-classificador | scikit-learn (LogisticRegression) |
+| Explicabilidade RF | SHAP |
+| Explicabilidade GNN | `torch_geometric.explain` (GNNExplainer) |
+| Streaming de JSON | ijson |
+| API | Golang 1.22 |
+| Banco | PostgreSQL 16 |
+| Orquestração | Docker Compose |
+
+### requirements.txt (Python)
+
+```
+numpy
+pandas
+scikit-learn
+torch
+torch-geometric
+shap
+ijson
+psycopg2-binary
+```
+
+---
+
+## Regras que não podem ser quebradas
+
+1. `veredito_final` sempre float — nunca binário
+2. `classificacao_bot` sempre 0 ou 1, derivado no INSERT a partir de `veredito_final >= 0.5`
+3. `label_real` obrigatório em todo INSERT
+4. Usuários com `neighbor: null` só alimentam o RF
+5. Meta-classificador treinado apenas com scores do `dev.json`, nunca do `test.json`
+6. Schema do banco vive em `init.sql`, nunca criado pelo Golang
+7. **Random Forest sempre envolvido em `CalibratedClassifierCV`**
+8. **XAI nunca roda em lote no pipeline principal** — apenas sob demanda
+9. **XAI não influencia o veredito** — é puramente investigativo, post-hoc
+10. Worker lê o `test.json` em streaming (via `ijson`), nunca carrega tudo na RAM
+11. `CLAUDE.md` e `data/` no `.gitignore`
+
+---
+
+## Argumento de defesa (para a banca)
+
+**Sobre as duas colunas de veredito:**
+> "A coluna `veredito_final` armazena a probabilidade bruta, permitindo ajuste
+> de limiar, análise de confiança e o estudo de caso com XAI. A coluna
+> `classificacao_bot` é a decisão binária derivada, que facilita auditoria
+> humana e comparação direta com o gabarito. As duas coexistem porque servem
+> consumidores diferentes."
+
+**Sobre XAI não rodar em todo o teste:**
+> "XAI não é classificador — não possui rótulo verdadeiro contra o qual medir
+> acurácia. Rodar SHAP em todo o conjunto de teste geraria milhares de
+> explicações sem critério analítico. O valor científico está em examinar
+> amostras estratificadas onde a explicação revela algo significativo."
+
+**Sobre o roteamento por cruzamento de fronteira:**
+> "A regra é puramente semântica: dois modelos que cruzam a fronteira de
+> decisão em direções opostas estão, por definição, em desacordo sobre a
+> natureza do usuário. Não há limiar arbitrário."
+
+**Sobre a calibração da Random Forest:**
+> "Random Forest não gera probabilidades calibradas por padrão. Como o
+> roteamento depende da fronteira em 0.5, a calibração via método isotônico
+> é condição necessária para garantir que `p_rf >= 0.5` represente uma
+> classificação real, não um artefato do algoritmo."
+
+---
+
+## Ordem de implementação
+
+1. `CLAUDE.md` + `.gitignore` ✅
+2. `docker-compose.yml`
+3. `init.sql` (tabela + view + índices)
+4. `inference/training/train_rf.py` (com `CalibratedClassifierCV`)
+5. `inference/training/train_gnn.py`
+6. `inference/training/train_lr.py`
+7. `inference/worker/router.py`
+8. `inference/worker/run_inference.py` (streaming + cálculo de `classificacao_bot`)
+9. `inference/evaluation/metrics.py`
+10. `api/` — handler, service, repository, model
+11. `inference/xai/` — explain_rf.py, explain_gnn.py, sample_selector.py

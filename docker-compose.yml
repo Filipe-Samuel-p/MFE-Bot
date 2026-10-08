@@ -17,35 +17,37 @@ services:
       retries: 10
 
   worker:
-    build: ./inference
-    depends_on:
-      postgres:
-        condition: service_healthy
+    build:
+      context: .
+      dockerfile: inference/Dockerfile
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: mfebot
+      DB_USER: mfebot
+      DB_PASSWORD: mfebot
     volumes:
       - ./data:/app/data:ro
-      - ./inference/models:/app/models:ro
-    environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: mfebot
-      DB_USER: mfebot
-      DB_PASSWORD: mfebot
-    restart: on-failure
-
-  api:
-    build: ./api
+      - ./inference/models:/app/inference/models:ro
     depends_on:
       postgres:
         condition: service_healthy
-    ports:
-      - "8080:8080"
+
+  api:
+    build:
+      context: ./api
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: mfebot
       DB_USER: mfebot
       DB_PASSWORD: mfebot
-    restart: unless-stopped
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:

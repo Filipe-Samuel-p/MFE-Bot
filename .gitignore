@@ -1,5 +1,6 @@
 data/
 inference/models/
+.venv/
 CLAUDE.md
 __pycache__/
 *.pyc

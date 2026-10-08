@@ -99,9 +99,9 @@ CREATE TABLE deteccao_bots (
 
 #### Fase 2 — Online (Docker)
 ```bash
+# Sobe o Postgres, roda o worker (processa test.json e popula o banco) e
+# inicia a API. O worker é um job: processa e encerra; a API permanece de pé.
 docker compose up --build
-# Disparar processamento
-curl -X POST http://localhost:8080/v1/process/run-test
 # Consultar métricas
 curl http://localhost:8080/v1/metrics/summary
 ```
@@ -197,9 +197,10 @@ CREATE TABLE deteccao_bots (
 
 #### Phase 2 — Online (Docker)
 ```bash
+# Starts Postgres, runs the worker (processes test.json and populates the
+# database) and starts the API. The worker is a one-off job: it processes
+# and exits; the API stays up.
 docker compose up --build
-# Trigger processing
-curl -X POST http://localhost:8080/v1/process/run-test
 # Query metrics
 curl http://localhost:8080/v1/metrics/summary
 ```
